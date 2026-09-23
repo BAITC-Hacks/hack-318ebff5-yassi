@@ -1,0 +1,12 @@
+import {readFileSync,readdirSync,mkdirSync,writeFileSync} from 'node:fs';
+import {join,extname} from 'node:path';
+import {pbkdf2Sync} from 'node:crypto';
+const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
+const assets={};
+for(const file of readdirSync('public'))assets['/'+file]={type:mime[extname(file)]||'text/plain',body:readFileSync(join('public',file),'utf8')};
+assets['/lib.mjs']={type:mime['.mjs'],body:readFileSync('lib.mjs','utf8')};
+const salt='f28ff8c37d7fa01b968cb2f5a0695413';
+const hash=salt+':'+pbkdf2Sync('Naqty2026!',Buffer.from(salt,'hex'),100000,32,'sha256').toString('hex');
+const output=`const ASSETS=${JSON.stringify(assets)};\nconst DEMO_HASH=${JSON.stringify(hash)};\n`+readFileSync('lib.mjs','utf8').replace(/export /g,'')+'\n'+readFileSync('seed.mjs','utf8').replace(/export /g,'')+'\n'+readFileSync('gemini.mjs','utf8').replace(/export /g,'')+'\n'+readFileSync('cloud/worker.mjs','utf8');
+mkdirSync('dist/server',{recursive:true});writeFileSync('dist/server/index.js',output);
+console.log(`Cloud Worker built: ${Buffer.byteLength(output)} bytes, ${Object.keys(assets).length} assets`);
