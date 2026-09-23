@@ -5,6 +5,9 @@ import sqlite3
 import hashlib
 import time
 import accounts
+import profiles
+import business_examples
+import assistant_logic
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,9 +32,9 @@ def connect():
 
 def rating(task):
     confirmed = bool(task.get('confirmed'))
-    breakdown = [{'field': key, 'label': label, 'max': weight, 'points': weight if confirmed and str(task.get(key, '')).strip() else 0} for key, label, weight in FIELDS]
+    breakdown = [{'field': key, 'label': label, 'max': weight, 'points': weight if confirmed and str(task.get(key, '')).strip() and (key != 'context' or str(task.get('need', '')).strip()) and (key != 'contact' or str(task.get('interaction', '')).strip()) else 0} for key, label, weight in FIELDS]
     score = sum(row['points'] for row in breakdown)
-    level = 'Алғашқы нұсқа' if score < 40 else 'Жұмысқа жарамды' if score < 70 else 'Дайын' if score < 90 else 'Басымдық берілген'
+    level = 'Бастапқы жоба' if score < 40 else 'Жұмысқа жарамды' if score < 70 else 'Дайын' if score < 90 else 'Басымдықты'
     return dict(score=score, level=level, breakdown=breakdown, missing=[row['label'] for row in breakdown if not row['points']])
 
 def task_view(row):
@@ -42,7 +45,11 @@ def initialize():
     with connect() as db:
         db.executescript('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS teams (id INTEGER PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS proposals (id INTEGER PRIMARY KEY, task_id INTEGER REFERENCES tasks(id), team_id INTEGER REFERENCES teams(id), idea TEXT, plan TEXT, deadline TEXT, link TEXT, status TEXT DEFAULT "pending", milestone INTEGER DEFAULT 0);')
         accounts.initialize(db)
+        if 'submitted' not in {r['name'] for r in db.execute('PRAGMA table_info(proposals)')}:
+            db.execute('ALTER TABLE proposals ADD COLUMN submitted INTEGER DEFAULT 0')
+            db.execute('UPDATE proposals SET submitted=1 WHERE milestone=1')
         if db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]:
+            initialize_demo(db)
             return
         seeds = [
             ('Клиент сұрақтарына жауап беретін AI көмекші', 'Qamqor Store', 'Сауда', 'Клиенттердің қайталанатын сұрақтарына жауап беруге күніне 3 сағат кетеді.', 'Анонимдендірілген 500 сұрақ пен тауарлар каталогы.', 'Сұрақтарға жауап беретін веб-көмекші.', 'Тест сұрақтарының кемінде 80%-ына дұрыс жауап.', '2 апта. Тек анонимдендірілген деректер.', 'Дүкен клиенттері мен қолдау қызметі.', 'Айдана • demo@example.com • аптасына 2 кеңес'),
@@ -60,6 +67,44 @@ def initialize():
             db.execute('INSERT INTO teams(body) VALUES (?)', (json.dumps(dict(name=name, interests=interests, skills=skills), ensure_ascii=False),))
         for task_id, team_id in [(1, 1), (1, 4), (2, 2), (3, 3), (5, 5)]:
             db.execute('INSERT INTO proposals(task_id,team_id,idea,plan,deadline,link) VALUES (?,?,?,?,?,?)', (task_id, team_id, 'Тапсырмаға арналған қарапайым әрі түсінікті веб-прототип ұсынамыз.', '1. Деректерді зерттеу\n2. Прототип құру\n3. Нәтижені тексеру', '14 күн', 'https://example.com/prototype'))
+        initialize_demo(db)
+
+def initialize_demo(db):
+    for role in ('business', 'student'):
+        username = 'sana_demo_' + role
+        row = db.execute('SELECT id FROM users WHERE username=? AND demo=1', (username,)).fetchone()
+        if row:
+            continue
+        profile = profiles.demo_profile(role)
+        team_id = 1 if role == 'student' else None
+        user_id = db.execute('INSERT INTO users(username,password,name,role,profile,completed,demo,team_id) VALUES (?,?,?,?,?,1,1,?)', (username, accounts.password_hash(accounts.secrets.token_urlsafe(32)), 'Демо бизнес' if role == 'business' else 'Демо студент', role, json.dumps(profile, ensure_ascii=False), team_id)).lastrowid
+        if role == 'business':
+            for task_row in db.execute('SELECT * FROM tasks').fetchall():
+                task = json.loads(task_row['body'])
+                if 'owner_id' not in task:
+                    task.update(owner_id=user_id, demo=True, need=task.get('context', ''))
+                    db.execute('UPDATE tasks SET body=? WHERE id=?', (json.dumps(task, ensure_ascii=False), task_row['id']))
+        else:
+            for team_row in db.execute('SELECT * FROM teams').fetchall():
+                team = json.loads(team_row['body'])
+                if 'owner_id' not in team:
+                    team['demo'] = True
+                    if team_row['id'] == team_id:
+                        team['owner_id'] = user_id
+                    db.execute('UPDATE teams SET body=? WHERE id=?', (json.dumps(team, ensure_ascii=False), team_row['id']))
+    # Preserve previous user data while migrating the split context/need fields.
+    for row in db.execute('SELECT * FROM tasks').fetchall():
+        task = json.loads(row['body'])
+        changed = False
+        if 'need' not in task:
+            task['need'] = task.get('context', '')
+            changed = True
+        if 'interaction' not in task:
+            task['interaction'] = task.get('contact', '')
+            changed = True
+        if changed:
+            db.execute('UPDATE tasks SET body=? WHERE id=?', (json.dumps(task, ensure_ascii=False), row['id']))
+    business_examples.install(db)
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -86,11 +131,13 @@ class Handler(SimpleHTTPRequestHandler):
             tasks = [t for t in tasks if t.get('published') or (user and t.get('owner_id') == user['id'])]
             teams = [{**json.loads(r['body']), 'id': r['id']} for r in db.execute('SELECT * FROM teams')]
             proposals = [dict(r) for r in db.execute('SELECT * FROM proposals')]
+            for task in tasks:
+                task['proposal_count'] = sum(1 for proposal in proposals if proposal['task_id'] == task['id'])
             for team in teams:
-                team['points'] = sum(25 for p in proposals if p['team_id'] == team['id'] and p['milestone'])
+                team['points'] = sum(10 for p in proposals if p['team_id'] == team['id'] and p['milestone'])
             own_tasks = {t['id'] for t in tasks if user and t.get('owner_id') == user['id']}
             proposals = [p for p in proposals if user and (p['task_id'] in own_tasks or p['team_id'] == user['team_id'])]
-        self.respond(dict(tasks=tasks, teams=teams, proposals=proposals, fields=FIELDS, aiMode='local-demo', user=user))
+        self.respond(dict(tasks=tasks, teams=teams, proposals=proposals, fields=FIELDS, aiMode='local-demo', user=user, profileFields=profiles.schema(user['role']) if user else []))
 
     def do_POST(self):
         try:
@@ -100,7 +147,7 @@ class Handler(SimpleHTTPRequestHandler):
             if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                 return self.respond({'error': 'JSON сұранысы қажет.'}, 415)
             length = int(self.headers.get('Content-Length', '0'))
-            if length < 0 or length > 3_000_000:
+            if length < 0 or length > 6_000_000:
                 raise ValueError('Сұраныс тым үлкен.')
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
@@ -112,6 +159,13 @@ class Handler(SimpleHTTPRequestHandler):
             self.respond({'error': 'Тапсырма немесе команда табылмады.'}, 400)
 
     def route(self, path, p):
+        if path == '/api/demo':
+            if p.get('role') not in ('business', 'student'):
+                raise ValueError('Демо рөлін таңдаңыз.')
+            with connect() as db:
+                row = db.execute('SELECT * FROM users WHERE username=? AND demo=1', ('sana_demo_' + p['role'],)).fetchone()
+                cookie = accounts.new_session(db, row['id'])
+            return self.respond({'user': accounts.public_user(row)}, cookie=cookie)
         if path in ('/api/register', '/api/login'):
             attempts = getattr(self.server, 'auth_attempts', {})
             self.server.auth_attempts = attempts
@@ -142,26 +196,31 @@ class Handler(SimpleHTTPRequestHandler):
             name, bio = str(p.get('name', '')).strip(), str(p.get('bio', '')).strip()
             if not name or len(name) > 80 or len(bio) > 500:
                 raise ValueError('Атау 1–80, сипаттама 0–500 таңба болуы керек.')
+            if user['role'] == 'student' and not bio:
+                raise ValueError('Өзіңіз жайлы қысқаша мәлімет енгізіңіз.')
             avatar = accounts.validate_image(p.get('avatar', user['avatar']))
+            profile = profiles.validate(user['role'], p.get('profile', {}))
             with connect() as db:
-                db.execute('UPDATE users SET name=?, bio=?, avatar=? WHERE id=?', (name, bio, avatar, user['id']))
+                db.execute('UPDATE users SET name=?, bio=?, avatar=?, profile=?, completed=1 WHERE id=?', (name, bio, avatar, json.dumps(profile, ensure_ascii=False), user['id']))
                 if user['team_id']:
-                    skills = str(p.get('skills', '')).strip()[:300]
-                    interests = str(p.get('interests', '')).strip()[:300]
-                    db.execute('UPDATE teams SET body=? WHERE id=?', (json.dumps(dict(name=name, skills=skills, interests=interests, avatar=avatar, owner_id=user['id']), ensure_ascii=False), user['team_id']))
+                    team = dict(name=profile['team_name'], skills=profile['team_skills'], technologies=profile['team_technologies'], interests=profile['interests'], members=profile['members'], avatar=avatar, owner_id=user['id'], demo=bool(user['demo']))
+                    db.execute('UPDATE teams SET body=? WHERE id=?', (json.dumps(team, ensure_ascii=False), user['team_id']))
             return self.respond({'ok': True})
+        if not user['completed']:
+            return self.respond({'error': 'Жалғастыру үшін алдымен профиліңізді толтырыңыз.'}, 403)
         if path in ('/api/tasks', '/api/decision', '/api/milestone') and user['role'] != 'business':
             return self.respond({'error': 'Бұл әрекет тек бизнес аккаунтына қолжетімді.'}, 403)
         if path == '/api/assist':
             description = str(p.get('description', '')).strip()
             if len(description) < 10:
                 raise ValueError('Сипаттама кемінде 10 таңбадан тұруы керек.')
-            questions = [{'field': key, 'label': label, 'question': QUESTIONS[key]} for key, label, _ in FIELDS if key != 'context']
-            return self.respond(dict(mode='local-demo', questions=questions, context=description, prompt=PROMPT))
+            analysis = assistant_logic.analyze(description)
+            return self.respond(dict(mode='local-demo', **analysis, potential_score=rating({**analysis['fields'], 'confirmed': True})['score'], prompt=PROMPT))
         if path == '/api/tasks':
-            allowed = ['title', 'company', 'category', 'original'] + [f[0] for f in FIELDS]
+            allowed = ['title', 'company', 'category', 'original', 'need', 'interaction'] + [f[0] for f in FIELDS]
             task = {k: str(p.get(k, '')).strip() for k in allowed}
             task['owner_id'] = user['id']
+            task['demo'] = bool(user['demo'])
             if not task['title'] or not task['company'] or len(task['context']) < 10:
                 raise ValueError('Атауын, ұйымды және кемінде 10 таңбалы сипаттаманы толтырыңыз.')
             if any(len(v) > 10000 for v in task.values() if isinstance(v, str)):
@@ -176,6 +235,8 @@ class Handler(SimpleHTTPRequestHandler):
                     previous = db.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
                     if not previous or json.loads(previous['body']).get('owner_id') != user['id']:
                         return self.respond({'error': 'Басқа пайдаланушының тапсырмасын өзгерте алмайсыз.'}, 403)
+                    if json.loads(previous['body']).get('example_key'):
+                        task['example_key'] = json.loads(previous['body'])['example_key']
                     cursor = db.execute('UPDATE tasks SET body=? WHERE id=?', (json.dumps(task, ensure_ascii=False), task_id))
                     if not cursor.rowcount:
                         raise ValueError('Тапсырма табылмады.')
@@ -186,16 +247,31 @@ class Handler(SimpleHTTPRequestHandler):
             if user['role'] != 'student' or p.get('team_id') != user['team_id']:
                 return self.respond({'error': 'Ұсынысты тек өз командаңыздың атынан жіберіңіз.'}, 403)
             values = [str(p.get(k, '')).strip() for k in ['idea', 'plan', 'deadline', 'link']]
-            if not all(values):
-                raise ValueError('Ұсыныстың барлық өрісін толтырыңыз.')
+            if not all(values[:3]) or any(len(v) > 10000 for v in values):
+                raise ValueError('Идеяны, жоспарды және мерзімді толтырыңыз (ең көбі 10000 таңба).')
             link = urlparse(values[3])
-            if link.scheme not in ('http', 'https') or not link.netloc:
+            if values[3] and (link.scheme not in ('http', 'https') or not link.netloc):
                 raise ValueError('Прототипке жарамды http немесе https сілтемесін енгізіңіз.')
             with connect() as db:
                 row = db.execute('SELECT * FROM tasks WHERE id=?', (p['task_id'],)).fetchone()
                 if not row or not json.loads(row['body']).get('published'):
                     raise ValueError('Тек жарияланған тапсырмаға ұсыныс жіберуге болады.')
                 db.execute('INSERT INTO proposals(task_id,team_id,idea,plan,deadline,link) VALUES (?,?,?,?,?,?)', (p['task_id'], p['team_id'], *values))
+            return self.respond({'ok': True})
+        if path == '/api/submit-prototype':
+            with connect() as db:
+                row = db.execute('SELECT * FROM proposals WHERE id=?', (p['id'],)).fetchone()
+                if not row or user['role'] != 'student' or row['team_id'] != user['team_id']:
+                    return self.respond({'error': 'Тек өз жобаңызға прототип ұсына аласыз.'}, 403)
+                if row['status'] != 'accepted':
+                    raise ValueError('Алдымен бизнес командаңызды таңдауы керек.')
+                link = str(p.get('link', '')).strip()
+                parsed = urlparse(link)
+                if parsed.scheme not in ('http', 'https') or not parsed.netloc or len(link) > 2000:
+                    raise ValueError('Прототиптің http немесе https сілтемесін енгізіңіз.')
+                if row['milestone']:
+                    raise ValueError('Бұл кезең расталып қойған.')
+                db.execute('UPDATE proposals SET submitted=1,link=? WHERE id=?', (link, p['id']))
             return self.respond({'ok': True})
         if path == '/api/decision':
             if p.get('status') not in ('accepted', 'rejected', 'pending'):
@@ -214,6 +290,8 @@ class Handler(SimpleHTTPRequestHandler):
                 row = db.execute('SELECT * FROM proposals WHERE id=?', (p['id'],)).fetchone()
                 if not row or row['status'] != 'accepted':
                     raise ValueError('Алдымен команданы таңдаңыз.')
+                if not row['submitted']:
+                    raise ValueError('Алдымен студент прототипті ұсынуы керек.')
                 db.execute('UPDATE proposals SET milestone=1 WHERE id=?', (p['id'],))
             return self.respond({'ok': True})
         self.respond({'error': 'Маршрут табылмады.'}, 404)
@@ -225,5 +303,5 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     initialize()
     port = int(os.environ.get('PORT', '8000'))
-    print(f'AI Sana: http://localhost:{port}', flush=True)
+    print(f'Sana Quest: http://localhost:{port}', flush=True)
     ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()

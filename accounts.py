@@ -5,6 +5,7 @@ import hmac
 import re
 import secrets
 import time
+import json
 from http.cookies import SimpleCookie
 
 
@@ -19,6 +20,11 @@ def initialize(db):
             token TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id), expires INTEGER
         );
     ''')
+    columns = {row['name'] for row in db.execute('PRAGMA table_info(users)')}
+    for name, definition in [('email', 'TEXT'), ('profile', "TEXT DEFAULT '{}'"), ('completed', 'INTEGER DEFAULT 0'), ('demo', 'INTEGER DEFAULT 0')]:
+        if name not in columns:
+            db.execute(f'ALTER TABLE users ADD COLUMN {name} {definition}')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS user_email ON users(email) WHERE email IS NOT NULL')
 
 
 def password_hash(password, salt=None):
@@ -28,7 +34,7 @@ def password_hash(password, salt=None):
 
 
 def public_user(row):
-    return {key: row[key] for key in ['id', 'username', 'name', 'role', 'bio', 'avatar', 'team_id']}
+    return {**{key: row[key] for key in ['id', 'username', 'name', 'role', 'bio', 'avatar', 'team_id', 'email', 'completed', 'demo']}, 'profile': json.loads(row['profile'])}
 
 
 def token_from(handler):
@@ -72,8 +78,13 @@ def validate_image(value):
 
 
 def register(db, payload):
-    username = str(payload.get('username', '')).strip().lower()
+    email = str(payload.get('email', '')).strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email) or len(email) > 254:
+        raise ValueError('Электрондық поштаны дұрыс енгізіңіз.')
+    username = 'user_' + secrets.token_hex(8)
     password = str(payload.get('password', ''))
+    if password != payload.get('password_confirm'):
+        raise ValueError('Құпиясөздер сәйкес келмейді.')
     name = str(payload.get('name', '')).strip()
     role = payload.get('role')
     if not re.fullmatch(r'[a-z0-9_.]{3,30}', username):
@@ -82,17 +93,17 @@ def register(db, payload):
         raise ValueError('Құпиясөз 8–128 таңбадан тұруы керек.')
     if not name or len(name) > 80 or role not in ('business', 'student'):
         raise ValueError('Атыңызды және аккаунт түрін дұрыс көрсетіңіз.')
-    if db.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone():
-        raise ValueError('Бұл логин бос емес. Басқа логин таңдаңыз.')
-    return db.execute('INSERT INTO users(username,password,name,role) VALUES (?,?,?,?)', (username, password_hash(password), name, role)).lastrowid
+    if db.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone():
+        raise ValueError('Бұл поштаға аккаунт тіркелген. Кіру батырмасын қолданыңыз.')
+    return db.execute('INSERT INTO users(username,password,name,role,email) VALUES (?,?,?,?,?)', (username, password_hash(password), name, role, email)).lastrowid
 
 
 def login(db, payload):
-    username = str(payload.get('username', '')).strip().lower()
+    username = str(payload.get('email', payload.get('username', ''))).strip().lower()
     password = str(payload.get('password', ''))
     if len(password) > 128:
         raise ValueError('Логин немесе құпиясөз қате.')
-    row = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    row = db.execute('SELECT * FROM users WHERE (email=? OR username=?) AND demo=0', (username, username)).fetchone()
     stored = row['password'] if row else password_hash('invalid', '0' * 32)
     candidate = password_hash(password, stored.split(':')[0])
     if not row or not hmac.compare_digest(candidate, stored):

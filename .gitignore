@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 sana.db
 sana.db-*
+.sana-test-*
